@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- launchd agent: check for queued Agency jobs every minute.
+     Install: replace /Users/YOU/agency and the agent command, copy to ~/Library/LaunchAgents/,
+     then `launchctl load ~/Library/LaunchAgents/com.browser-use.agency.jobs.plist`. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.browser-use.agency.jobs</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/YOU/agency</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>node</string>
+    <string>scripts/run-jobs.mjs</string>
+    <string>--once</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENCY_AGENT_CMD</key>
+    <string>claude -p --permission-mode bypassPermissions</string>
+    <key>RADAR_URL</key>
+    <string>http://localhost:3100</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/agency-jobs.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/agency-jobs.log</string>
+</dict>
+</plist>

@@ -67,8 +67,9 @@ laptop's localhost, files or signed-in browser.
 The coding agent starts by reading [the skill](skills/agency/SKILL.md), infers a short editable profile
 from relevant context, and creates the first cards. The website also lets you enter a dream.
 **Save dream saves that brief; it does not launch an agent.**
-There is no installed background worker, automatic thread injection or built-in connector wizard.
-The active coding agent reads jobs, assigns workers and verifies their results.
+There is no automatic thread injection or built-in connector wizard. The active coding agent reads
+jobs, assigns workers and verifies their results. To have clicks executed while no session is open,
+use the optional [job runner](#run-queued-jobs-automatically).
 
 The agent reads your brief, relevant Codex or Claude prompts, feedback and past work to learn your
 goals, role and everyday tools. It learns your words from your prompts and sent messages, keeping a
@@ -93,6 +94,31 @@ If ongoing work is useful, agree to a four-hour cadence or choose another. The a
 runner's scheduler, reuses any matching schedule and records the real checkout, app URL, profile
 and approval-policy/layout paths. It reports a meaningful result or blocker, not empty periodic updates.
 A cadence written in a profile does not itself run anything.
+
+### Run queued jobs automatically
+
+A click only queues a job. `scripts/run-jobs.mjs` is an optional poller that executes those jobs with a
+headless coding agent, so a click works without an open session. It claims each queued job, hands the
+job, its card context and the approval policy to the agent, and posts the agent's result back to the
+card. It runs one job at a time and renews the job's lease while the agent works.
+
+```bash
+AGENCY_AGENT_CMD='claude -p --permission-mode bypassPermissions' node scripts/run-jobs.mjs --once
+AGENCY_AGENT_CMD='codex exec --full-auto -' node scripts/run-jobs.mjs --interval 60
+```
+
+The prompt goes to the agent on stdin, or to `{promptFile}` if the command contains that placeholder.
+The agent ends by writing a result file whose first line is `OUTCOME: completed`, `review` or
+`blocked`. Prompts, results and agent logs stay in `.agent-output/jobs/<id>/`. Optional settings are
+`AGENCY_JOB_TIMEOUT_MIN`, `AGENCY_NOTIFY_CMD` (called as `<cmd> <title> <body>`), `APPROVALS_PATH`
+and `ME_PATH`; the script header lists all of them.
+
+To check every minute, use the templates in `scripts/runner/`: `agency-jobs.service` and
+`agency-jobs.timer` for systemd on Linux, `com.browser-use.agency.jobs.plist` for launchd on macOS.
+Set the checkout path and agent command in them first.
+
+The runner acts on your clicks without asking again. Give the agent the permissions those actions
+need and no more. The approval policy still decides what a click authorizes.
 
 ### Profile, layout and approval settings
 
