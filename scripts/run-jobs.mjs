@@ -6,7 +6,7 @@
 // command you configure, and posts the agent's result back to the card.
 //
 // Usage:
-//   AGENCY_AGENT_CMD='claude -p --permission-mode bypassPermissions' node scripts/run-jobs.mjs --once
+//   AGENCY_AGENT_CMD="claude -p --permission-mode acceptEdits --allowedTools 'Bash(node scripts/push-card.mjs *)'" node scripts/run-jobs.mjs --once
 //   AGENCY_AGENT_CMD='codex exec --full-auto -' node scripts/run-jobs.mjs --interval 60
 //
 // Environment:
@@ -14,15 +14,18 @@
 //                      or replaces {promptFile} with the prompt's path if the command contains it.
 //   RADAR_URL          App URL (default http://localhost:3100).
 //   AGENCY_AGENT_KEY   Sent as x-radar-agent-key when the app is not on loopback.
-//   AGENCY_JOB_TIMEOUT_MIN  Minutes per job before the agent is stopped (default 45).
+//   AGENCY_JOB_TIMEOUT_MIN  Minutes per job before the agent is stopped (default 45, at least 1).
 //   AGENCY_RUNNER_DIR  Where prompts, results and logs go (default .agent-output/jobs, git-ignored).
 //   AGENCY_NOTIFY_CMD  Optional command called as `<cmd> <title> <body>` after each job.
 //   APPROVALS_PATH, ME_PATH  Passed on to the agent as the policy and profile to read.
 //
 // Jobs run one at a time. A lock file keeps timer-started runs from overlapping.
+//
+// The agent only gets the permissions its command grants. Widen them per action your cards need, for
+// example with more --allowedTools entries; a full permission bypass lets every click use every tool.
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rm, writeFile, open } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,20 +37,26 @@ const intervalSeconds = intervalIndex >= 0 ? Number(args[intervalIndex + 1]) : 6
 
 const baseUrl = process.env.RADAR_URL ?? "http://localhost:3100";
 const agentCommand = process.env.AGENCY_AGENT_CMD?.trim();
-const timeoutMs = Number(process.env.AGENCY_JOB_TIMEOUT_MIN ?? 45) * 60_000;
+const timeoutMinutes = Number(process.env.AGENCY_JOB_TIMEOUT_MIN ?? 45);
+const timeoutMs = timeoutMinutes * 60_000;
+const killGraceMs = 30_000;
 const runnerDir = resolve(root, process.env.AGENCY_RUNNER_DIR ?? ".agent-output/jobs");
 const notifyCommand = process.env.AGENCY_NOTIFY_CMD?.trim();
 const leaseRenewMs = 10 * 60_000;
 
 if (!agentCommand) {
   console.error("Set AGENCY_AGENT_CMD to the headless agent command, for example:");
-  console.error("  AGENCY_AGENT_CMD='claude -p --permission-mode bypassPermissions'");
+  console.error(`  AGENCY_AGENT_CMD="claude -p --permission-mode acceptEdits --allowedTools 'Bash(node scripts/push-card.mjs *)'"`);
   console.error("  AGENCY_AGENT_CMD='codex exec --full-auto -'");
   console.error("The agent acts on your clicks without asking again, so give it the permissions those actions need and no more.");
   process.exit(1);
 }
 if (!Number.isFinite(intervalSeconds) || intervalSeconds < 10) {
   console.error("--interval must be at least 10 seconds");
+  process.exit(1);
+}
+if (!Number.isFinite(timeoutMinutes) || timeoutMinutes < 1) {
+  console.error("AGENCY_JOB_TIMEOUT_MIN must be a number of minutes, at least 1");
   process.exit(1);
 }
 
@@ -76,7 +85,9 @@ async function updateJob(id, status, result, ticketOutcome) {
 function notify(title, body) {
   if (!notifyCommand) return;
   const [command, ...commandArgs] = splitCommand(notifyCommand);
-  spawn(command, [...commandArgs, title, body], { stdio: "ignore", detached: true }).unref();
+  const child = spawn(command, [...commandArgs, title, body], { stdio: "ignore", detached: true });
+  child.on("error", (error) => log(`notify command failed: ${error.message}`));
+  child.unref();
 }
 
 // Split a command line on spaces while keeping quoted parts together. No shell is involved.
@@ -172,20 +183,40 @@ function runAgent(prompt, promptFile, logFile) {
   return new Promise((resolvePromise) => {
     const usesFile = agentCommand.includes("{promptFile}");
     const [command, ...commandArgs] = splitCommand(agentCommand.replaceAll("{promptFile}", promptFile));
-    const child = spawn(command, commandArgs, { cwd: root, stdio: ["pipe", "pipe", "pipe"] });
+    // Own process group, so a timeout can stop the agent together with everything it started.
+    const child = spawn(command, commandArgs, { cwd: root, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     const chunks = [];
     child.stdout.on("data", (chunk) => chunks.push(chunk));
     child.stderr.on("data", (chunk) => chunks.push(chunk));
-    const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
-    child.on("error", async (error) => {
+    let settled = false;
+    let timedOut = false;
+    let killTimer;
+    const stop = (signal) => {
+      try {
+        if (process.platform === "win32") child.kill(signal);
+        else process.kill(-child.pid, signal);
+      } catch {
+        // already gone
+      }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stop("SIGTERM");
+      killTimer = setTimeout(() => stop("SIGKILL"), killGraceMs);
+    }, timeoutMs);
+    const finish = async (code, output) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      await writeFile(logFile, String(error));
-      resolvePromise({ code: -1, timedOut: false });
-    });
-    child.on("close", async (code, signal) => {
-      clearTimeout(timer);
-      await writeFile(logFile, Buffer.concat(chunks));
-      resolvePromise({ code, timedOut: signal === "SIGTERM" });
+      clearTimeout(killTimer);
+      await writeFile(logFile, output);
+      resolvePromise({ code, timedOut });
+    };
+    // A command that cannot start emits error and then close; the error is the part worth keeping.
+    child.on("error", (error) => finish(-1, String(error)));
+    child.on("close", (code) => finish(code, Buffer.concat(chunks)));
+    child.stdin.on("error", () => {
+      // the agent exited without reading its prompt; close reports the result
     });
     if (!usesFile) child.stdin.end(prompt);
     else child.stdin.end();
@@ -221,7 +252,7 @@ async function runJob(job) {
   const report = result.split("\n").slice(1).join("\n").trim();
 
   if (!outcome) {
-    const reason = timedOut ? `The agent was stopped after ${timeoutMs / 60_000} minutes.` : `The agent exited with code ${code} and wrote no result.`;
+    const reason = timedOut ? `The agent was stopped after ${timeoutMinutes} minutes.` : `The agent exited with code ${code} and wrote no result.`;
     await updateJob(job.id, "failed", `${reason} Nothing is confirmed done. Log: ${logFile}`, "blocked");
     notify("Agency job failed", String(job.buttonLabel));
     log(`job ${job.id} failed: ${reason}`);
@@ -233,28 +264,52 @@ async function runJob(job) {
   log(`job ${job.id} ${outcome}`);
 }
 
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+// Create the lock exclusively, so two runners started at once cannot both get it.
+async function acquireLock(lockFile) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const handle = await open(lockFile, "wx");
+      await handle.writeFile(String(process.pid));
+      await handle.close();
+      return true;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    const holder = await readFile(lockFile, "utf8").catch(() => "");
+    const pid = Number(holder);
+    if (!holder) {
+      // The holder is between creating and writing the file, or just removed it.
+      await new Promise((wait) => setTimeout(wait, 200));
+      continue;
+    }
+    if (pid && isAlive(pid)) {
+      log(`another runner (pid ${pid}) is active, exiting`);
+      return false;
+    }
+    // Stale lock from a runner that died. Remove it only if it is still the one we read.
+    if ((await readFile(lockFile, "utf8").catch(() => "")) === holder) await rm(lockFile, { force: true });
+  }
+  log("could not take the runner lock, exiting");
+  return false;
+}
+
 async function withLock(fn) {
   await mkdir(runnerDir, { recursive: true });
   const lockFile = join(runnerDir, "runner.lock");
-  if (existsSync(lockFile)) {
-    const pid = Number(readFileSync(lockFile, "utf8"));
-    if (pid && pid !== process.pid) {
-      try {
-        process.kill(pid, 0);
-        log(`another runner (pid ${pid}) is active, exiting`);
-        return;
-      } catch {
-        // stale lock from a runner that died
-      }
-    }
-  }
-  const handle = await open(lockFile, "w");
-  await handle.writeFile(String(process.pid));
-  await handle.close();
+  if (!(await acquireLock(lockFile))) return;
   try {
     await fn();
   } finally {
-    await rm(lockFile, { force: true });
+    if ((await readFile(lockFile, "utf8").catch(() => "")) === String(process.pid)) await rm(lockFile, { force: true });
   }
 }
 

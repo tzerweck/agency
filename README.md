@@ -103,7 +103,7 @@ job, its card context and the approval policy to the agent, and posts the agent'
 card. It runs one job at a time and renews the job's lease while the agent works.
 
 ```bash
-AGENCY_AGENT_CMD='claude -p --permission-mode bypassPermissions' node scripts/run-jobs.mjs --once
+AGENCY_AGENT_CMD="claude -p --permission-mode acceptEdits --allowedTools 'Bash(node scripts/push-card.mjs *)'" node scripts/run-jobs.mjs --once
 AGENCY_AGENT_CMD='codex exec --full-auto -' node scripts/run-jobs.mjs --interval 60
 ```
 
@@ -115,10 +115,14 @@ and `ME_PATH`; the script header lists all of them.
 
 To check every minute, use the templates in `scripts/runner/`: `agency-jobs.service` and
 `agency-jobs.timer` for systemd on Linux, `com.browser-use.agency.jobs.plist` for launchd on macOS.
-Set the checkout path and agent command in them first.
+Set the checkout path, agent command and `PATH` in them first.
 
-The runner acts on your clicks without asking again. Give the agent the permissions those actions
-need and no more. The approval policy still decides what a click authorizes.
+The runner acts on your clicks without asking again, so the agent command is the only hard limit on
+what a job can do. The Claude example allows file edits in the checkout and pushing card updates;
+add `--allowedTools` entries for the actions your cards need, such as a mail or GitHub CLI.
+`--permission-mode bypassPermissions` gives every job every tool; use it only if you accept that.
+The runner gives the agent the approval policy and tells it to follow it, but the app does not
+enforce the policy.
 
 ### Profile, layout and approval settings
 
