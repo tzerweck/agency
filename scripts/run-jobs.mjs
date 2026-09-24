@@ -26,6 +26,7 @@
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rm, writeFile, open } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { constants } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -64,6 +65,27 @@ const headers = { "content-type": "application/json", "x-radar-local-agent": "1"
 if (process.env.AGENCY_AGENT_KEY) headers["x-radar-agent-key"] = process.env.AGENCY_AGENT_KEY;
 
 const log = (...parts) => console.log(new Date().toISOString(), ...parts);
+
+// The agent runs in its own process group, so Ctrl-C or a service stop reaches only this runner.
+// The first signal stops the running agent, records its job and exits; a second one kills it at once.
+let stopSignal = null;
+let abortAgent = null;
+let wakeUp = null;
+
+function requestStop(signal) {
+  if (stopSignal) {
+    log(`${signal} again, killing the agent now`);
+    abortAgent?.(true);
+    process.exit(128 + constants.signals[signal]);
+  }
+  stopSignal = signal;
+  process.exitCode = 128 + constants.signals[signal];
+  log(abortAgent ? `${signal} received, stopping the agent` : `${signal} received, exiting`);
+  abortAgent?.(false);
+  wakeUp?.();
+}
+
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => requestStop(signal));
 
 async function listJobs() {
   const response = await fetch(`${baseUrl}/api/agent-jobs`, { headers });
@@ -190,6 +212,7 @@ function runAgent(prompt, promptFile, logFile) {
     child.stderr.on("data", (chunk) => chunks.push(chunk));
     let settled = false;
     let timedOut = false;
+    let interrupted = false;
     let killTimer;
     const stop = (signal) => {
       try {
@@ -199,18 +222,29 @@ function runAgent(prompt, promptFile, logFile) {
         // already gone
       }
     };
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const terminate = () => {
       stop("SIGTERM");
       killTimer = setTimeout(() => stop("SIGKILL"), killGraceMs);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      terminate();
     }, timeoutMs);
+    abortAgent = (now) => {
+      if (now) return stop("SIGKILL");
+      if (interrupted || timedOut) return;
+      interrupted = true;
+      clearTimeout(timer);
+      terminate();
+    };
     const finish = async (code, output) => {
       if (settled) return;
       settled = true;
+      abortAgent = null;
       clearTimeout(timer);
       clearTimeout(killTimer);
       await writeFile(logFile, output);
-      resolvePromise({ code, timedOut });
+      resolvePromise({ code, timedOut, interrupted });
     };
     // A command that cannot start emits error and then close; the error is the part worth keeping.
     child.on("error", (error) => finish(-1, String(error)));
@@ -220,6 +254,7 @@ function runAgent(prompt, promptFile, logFile) {
     });
     if (!usesFile) child.stdin.end(prompt);
     else child.stdin.end();
+    if (stopSignal) abortAgent(false);
   });
 }
 
@@ -244,7 +279,7 @@ async function runJob(job) {
 
   // Renew the lease while the agent works, so a long job is not handed out a second time.
   const renew = setInterval(() => updateJob(job.id, "running").catch((error) => log(`lease renewal failed: ${error.message}`)), leaseRenewMs);
-  const { code, timedOut } = await runAgent(prompt, promptFile, logFile);
+  const { code, timedOut, interrupted } = await runAgent(prompt, promptFile, logFile);
   clearInterval(renew);
 
   const result = existsSync(resultFile) ? await readFile(resultFile, "utf8") : "";
@@ -252,7 +287,11 @@ async function runJob(job) {
   const report = result.split("\n").slice(1).join("\n").trim();
 
   if (!outcome) {
-    const reason = timedOut ? `The agent was stopped after ${timeoutMinutes} minutes.` : `The agent exited with code ${code} and wrote no result.`;
+    const reason = timedOut
+      ? `The agent was stopped after ${timeoutMinutes} minutes.`
+      : interrupted
+        ? `The runner was stopped (${stopSignal}) while the agent worked.`
+        : `The agent exited with code ${code} and wrote no result.`;
     await updateJob(job.id, "failed", `${reason} Nothing is confirmed done. Log: ${logFile}`, "blocked");
     notify("Agency job failed", String(job.buttonLabel));
     log(`job ${job.id} failed: ${reason}`);
@@ -316,6 +355,7 @@ async function withLock(fn) {
 async function poll() {
   const jobs = await listJobs();
   for (const job of jobs) {
+    if (stopSignal) return;
     try {
       await runJob(job);
     } catch (error) {
@@ -330,12 +370,20 @@ await withLock(async () => {
     return;
   }
   log(`polling ${baseUrl} every ${intervalSeconds} s`);
-  for (;;) {
+  while (!stopSignal) {
     try {
       await poll();
     } catch (error) {
       log(error.message);
     }
-    await new Promise((wait) => setTimeout(wait, intervalSeconds * 1000));
+    if (stopSignal) break;
+    await new Promise((wait) => {
+      const timer = setTimeout(wait, intervalSeconds * 1000);
+      wakeUp = () => {
+        clearTimeout(timer);
+        wait();
+      };
+    });
+    wakeUp = null;
   }
 });
