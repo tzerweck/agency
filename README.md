@@ -100,7 +100,8 @@ A cadence written in a profile does not itself run anything.
 A click only queues a job. `scripts/run-jobs.mjs` is an optional poller that executes those jobs with a
 headless coding agent, so a click works without an open session. It claims each queued job, hands the
 job, its card context and the approval policy to the agent, and posts the agent's result back to the
-card. It runs one job at a time and renews the job's lease while the agent works.
+card. It runs one job at a time and renews the job's lease while the agent works. Stopping the runner
+stops the agent and puts its job back in the queue, marked as reclaimed.
 
 ```bash
 AGENCY_AGENT_CMD="claude -p --permission-mode acceptEdits --allowedTools 'Bash(node scripts/push-card.mjs *)'" node scripts/run-jobs.mjs --once
@@ -269,6 +270,7 @@ Include `x-radar-local-agent: 1` for local agent requests.
 - One coordinator assigns each job. `POST /api/agent-jobs` with
   `{"id":123,"status":"running"}` starts work; repeated running updates renew its six-hour lease.
   GET may return expired running work as `reclaimed: true`, subject to ten concurrent slots.
+  `{"id":123,"status":"queued"}` hands running work back at once; GET then returns it as reclaimed.
   The API has no exclusive worker token. Coordinate other active agents and recheck live state;
   do not assume a successful running update prevents another worker from acting.
 - Reuse the canonical `dedupeKey`, based on project, subject, problem, outcome and stable anchors.

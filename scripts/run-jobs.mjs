@@ -67,8 +67,8 @@ if (process.env.AGENCY_AGENT_KEY) headers["x-radar-agent-key"] = process.env.AGE
 const log = (...parts) => console.log(new Date().toISOString(), ...parts);
 
 // The agent runs in its own process group, so Ctrl-C or a service stop reaches only this runner.
-// The first signal stops the running agent and exits; a second one kills it at once. The job stays
-// running either way and comes back as reclaimed when its lease expires.
+// The first signal stops the running agent, hands its job back to the queue and exits. A second one
+// kills the agent at once and leaves the job to come back when its lease expires.
 let stopSignal = null;
 let abortAgent = null;
 let wakeUp = null;
@@ -289,9 +289,16 @@ async function runJob(job) {
   const report = result.split("\n").slice(1).join("\n").trim();
 
   if (!outcome && interrupted) {
-    // The agent may already have acted. Leave the job running, so it returns as reclaimed once the lease
-    // expires and the next run checks what was done, instead of blocking the card for good.
-    log(`job ${job.id} left running after ${stopSignal}; it returns as reclaimed when its lease expires`);
+    // The agent may already have acted, so do not fail the job. Hand it back: the next run gets it as
+    // reclaimed and checks what was done first.
+    try {
+      await updateJob(job.id, "queued", `Interrupted when the runner stopped (${stopSignal}). Back in the queue; the next run checks what was already done.`);
+      log(`job ${job.id} handed back to the queue after ${stopSignal}`);
+      notify("Agency job interrupted", `${job.buttonLabel}: back in the queue`);
+    } catch (error) {
+      log(`job ${job.id} could not be handed back (${error.message}); it returns when its lease expires`);
+      notify("Agency job interrupted", `${job.buttonLabel}: returns when its lease expires`);
+    }
     return;
   }
   if (!outcome) {
