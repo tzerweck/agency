@@ -50,7 +50,10 @@ export async function POST(request: Request) {
   const cardContext = JSON.stringify({ idea, click: { action: payload.action, label, instruction, note } });
   const job = await db.prepare("INSERT INTO agent_jobs (idea_id, action, button_label, instruction, user_feedback, card_context) VALUES (?, ?, ?, ?, ?, ?) RETURNING id")
     .bind(payload.id, payload.action, label, instruction, note, cardContext).first();
-  await db.batch(decisionUpdates);
-  await announceQueuedJob();
+  try {
+    await db.batch(decisionUpdates);
+  } finally {
+    await announceQueuedJob();
+  }
   return Response.json({ ok: true, jobId: job?.id, status });
 }
